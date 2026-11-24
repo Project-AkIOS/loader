@@ -60,8 +60,8 @@ typedef size_t UINTN; typedef int BOOLEAN;
 enum { EfiReservedMemoryType, EfiLoaderCode, EfiLoaderData, EfiBootServicesCode, EfiBootServicesData,
        EfiRuntimeServicesCode, EfiRuntimeServicesData, EfiConventionalMemory };
 typedef struct { UINT32 Type; UINT64 PhysicalStart; UINT64 VirtualStart; UINT64 NumberOfPages; UINT64 Attribute; } EFI_MEMORY_DESCRIPTOR;
-static UINT64 ReadUnaligned64(const UINT64 *p) { UINT64 v; memcpy(&v, p, 8); return v; }
-static void WriteUnaligned64(UINT64 *p, UINT64 v) { memcpy(p, &v, 8); }
+static UINT64 ReadUnaligned64(const UINT64 *p) { UINT64 v; memcpy(&v, (const unsigned char *)p, 8); return v; }
+static void WriteUnaligned64(UINT64 *p, UINT64 v) { memcpy((unsigned char *)p, &v, 8); }
 #include "MemoryWindow.h"
 size_t outside(const void *map, size_t size, size_t stride, UINT64 base, UINT64 window, UINT8 *table, size_t capacity, UINT64 *bytes) {
   return DarwinOutsideRanges(map, size, stride, base, window, 0x10000, 0x100000, table, capacity, bytes);
@@ -70,7 +70,7 @@ UINT64 unused_start(const void *m, size_t s, size_t t) { UINT64 u; return Darwin
 size_t unused_exclusions(const void *m, size_t s, size_t t, UINT8 *table, UINT64 *e) { return DarwinWindowExclusions(m, s, t, 0, 0, table, 0, e); }
 ''')
     library = work / 'outside.dylib'
-    subprocess.run(['clang', '-Wall', '-Wextra', '-Werror', '-fsanitize=undefined', '-fno-sanitize-recover=all',
+    subprocess.run(['clang', '-Wall', '-Wextra', '-Werror', '-fsanitize=undefined', '-fsanitize-trap=undefined', '-fno-sanitize-recover=all',
                     '-shared', '-fPIC', '-I', str(header.parent), str(work / 'test.c'), '-o', str(library)], check=True)
     lib = ctypes.CDLL(str(library))
     u64, size_t = ctypes.c_uint64, ctypes.c_size_t

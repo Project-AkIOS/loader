@@ -52,7 +52,7 @@ def node(name, properties=(), children=()):
 with tempfile.TemporaryDirectory(prefix='darwinboot-adt-') as temporary:
     work = Path(temporary)
     (work / 'parser.c').write_text(preamble + parser + entry)
-    subprocess.run(['clang', '-Wall', '-Wextra', '-Werror', '-fsanitize=undefined', '-fno-sanitize-recover=all', '-shared', '-fPIC',
+    subprocess.run(['clang', '-Wall', '-Wextra', '-Werror', '-fsanitize=undefined', '-fsanitize-trap=undefined', '-fno-sanitize-recover=all', '-shared', '-fPIC',
                     '-I', str(driver), str(work / 'parser.c'), '-o', str(work / 'parser.dylib')], check=True)
     lib = ctypes.CDLL(str(work / 'parser.dylib'))
     lib.parse.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_uint64),
