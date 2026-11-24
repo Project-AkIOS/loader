@@ -44,4 +44,18 @@ UniXNURun (
   IN UNIXNU_HOST  Host
   );
 
+/**
+  AkIOS: where a host keeps UniXNU's log lines (each with its "UNIXNU: " prefix and CR LF), besides the serial
+  port and the debug channel -- the phone has no serial console, so AkIOS's boot application writes them to a
+  log partition. NULL (the default): no copy.
+**/
+typedef
+VOID
+(EFIAPI *UNIXNU_LOG_SINK)(
+  IN CONST CHAR8  *Line,
+  IN UINTN        Length
+  );
+
+extern UNIXNU_LOG_SINK  gUniXNULogSink;
+
 #endif

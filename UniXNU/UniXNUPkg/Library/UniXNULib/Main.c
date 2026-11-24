@@ -11,6 +11,8 @@
 
 STATIC EFI_SERIAL_IO_PROTOCOL  *mSerial;
 
+UNIXNU_LOG_SINK  gUniXNULogSink;
+
 VOID
 UniXNULogInit (
   VOID
@@ -43,6 +45,9 @@ UniXNULog (
   if (mSerial != NULL) {
     Size = AsciiStrLen (Line);
     mSerial->Write (mSerial, &Size, Line);
+  }
+  if (gUniXNULogSink != NULL) {
+    gUniXNULogSink (Line, AsciiStrLen (Line));
   }
 }
 
