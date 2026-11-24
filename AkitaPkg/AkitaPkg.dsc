@@ -47,5 +47,6 @@
 
 [Components]
   AkitaPkg/Application/AkiosBoot/AkiosBoot.inf
+  UniXNUPkg/Application/UniXNU/UniXNU.inf
   DarwinBootPkg/Driver/DarwinBoot.inf
   FatPkg/EnhancedFatDxe/Fat.inf
