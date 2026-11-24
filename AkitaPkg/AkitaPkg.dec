@@ -1,0 +1,20 @@
+## @file
+#  AkIOS on the Pixel 8a (akita): the boot application U-Boot starts, and the pieces of the loader that are the
+#  phone's own. Built with UniXNUPkg and DarwinBootPkg (AkitaPkg.dsc).
+#
+#  SPDX-License-Identifier: BSD-2-Clause-Patent
+##
+
+[Defines]
+  DEC_SPECIFICATION = 0x0001001B
+  PACKAGE_NAME      = AkitaPkg
+  PACKAGE_GUID      = 6B0D2C41-58E3-4E8B-9F0B-3C2A7D1E5A90
+  PACKAGE_VERSION   = 0.1
+
+[Includes]
+  Include
+
+[Guids]
+  ## the vendor device path of the ESP image in the boot payload
+  gAkitaPayloadDiskGuid = { 0x8f2b6a51, 0x2d47, 0x4c1e, { 0x9a, 0x3e, 0x51, 0x6b, 0x0c, 0x77, 0xd2, 0x14 } }
+  gAkitaPkgTokenSpaceGuid = { 0x3c5e0b72, 0x91d4, 0x4a6f, { 0xb8, 0x21, 0x7e, 0x40, 0x9d, 0x16, 0xc3, 0x5b } }
