@@ -14,6 +14,7 @@
 #include <Protocol/LoadedImage.h>
 #include <Protocol/GraphicsOutput.h>
 #include <Protocol/SimpleFileSystem.h>
+#include <Protocol/SerialIo.h>
 #include "BootArgs.h"
 #include "BootVideo.h"
 #include "PackedRamdisk.h"
@@ -22,7 +23,11 @@
 #include "LoaderInputs.h"
 
 #define WINDOW_SIZE  SIZE_256MB
-#define BLOCK_SIZE   SIZE_2MB
+// The kernel's physical and virtual addresses agree modulo this: XNU's first page tables (start.s) map the kernel
+// with level 2 blocks, 2 MiB with 4 KiB pages and 32 MiB with the 16 KiB pages of an arm64 iOS kernel.
+#define BLOCK_SIZE   SIZE_32MB
+// A window that cannot have the size the device tree asks for may be smaller, down to this.
+#define WINDOW_MIN   SIZE_1GB
 // The largest kernel file read: the default window. A macOS kernel collection is about 137 MiB; the window check
 // below still bounds the kernel with everything placed after it.
 #define KERNEL_LIMIT SIZE_256MB
@@ -57,13 +62,50 @@ typedef struct {
 
 STATIC EFI_HANDLE  mImage;
 UINT64 EFIAPI DarwinCurrentEl (VOID);
-VOID EFIAPI DarwinEnter (UINT64 Args, UINT64 Entry, UINT64 Memory, UINT64 Size, UINT64 VideoBase, UINT64 VideoBytes);
+UINT64 EFIAPI DarwinMpidr (VOID);
+UINT64 EFIAPI DarwinCounter (VOID);
+VOID EFIAPI DarwinEnter (UINT64 Args, UINT64 Entry, UINT64 Memory, UINT64 Size, UINT64 VideoBase, UINT64 VideoBytes,
+                         UINT64 El2Vectors);
 VOID EFIAPI DarwinFlush (UINT64 Memory, UINT64 Size);
+// Entry.S: the EL2 code the kernel's cores keep (copied out of the image), where its vectors lie in it, its size.
+extern UINT8   DarwinEl2Trampoline[];
+extern UINT64  DarwinEl2VectorsOffset;
+extern UINT64  DarwinEl2TrampolineSize;
 
 #define READ_SYSREG(Name)  ({ UINT64 Value_; __asm__ volatile ("mrs %0, " #Name : "=r" (Value_)); Value_; })
 
 STATIC UINT32 U32 (CONST VOID *P) { return ReadUnaligned32 ((CONST UINT32 *)P); }
 STATIC UINT64 U64 (CONST VOID *P) { return ReadUnaligned64 ((CONST UINT64 *)P); }
+
+STATIC EFI_SERIAL_IO_PROTOCOL  *mSerial;
+
+// Print, and the same text to the firmware's serial port: a phone has no screen anyone reads at boot, and its
+// firmware's serial port is the log it keeps over a restart (akita: the pstore zone Android shows).
+STATIC
+VOID
+EFIAPI
+DarwinLog (IN CONST CHAR16 *Format, ...)
+{
+  VA_LIST  Marker;
+  CHAR16   Line[640];
+  CHAR8    Ascii[640];
+  UINTN    Index;
+  UINTN    Size;
+
+  VA_START (Marker, Format);
+  UnicodeVSPrint (Line, sizeof (Line), Format, Marker);
+  VA_END (Marker);
+  if (gST->ConOut != NULL) { gST->ConOut->OutputString (gST->ConOut, Line); }
+  if ((mSerial == NULL) && EFI_ERROR (gBS->LocateProtocol (&gEfiSerialIoProtocolGuid, NULL, (VOID **)&mSerial))) {
+    mSerial = NULL;
+  }
+  if (mSerial == NULL) { return; }
+  for (Index = 0; (Line[Index] != 0) && (Index < ARRAY_SIZE (Ascii) - 1); Index++) {
+    Ascii[Index] = (Line[Index] < 0x80) ? (CHAR8)Line[Index] : '?';
+  }
+  Size = Index;
+  mSerial->Write (mSerial, &Size, Ascii);
+}
 
 STATIC
 EFI_STATUS
@@ -111,7 +153,7 @@ ReadFile (
   Status = File->GetInfo (File, &gEfiFileInfoGuid, &InfoSize, Info);
   if (EFI_ERROR (Status)) { goto Done; }
   if ((Info->Attribute & EFI_FILE_DIRECTORY) || (Info->FileSize == 0) || (Info->FileSize > Limit)) {
-    Print (L"DARWINBOOT: %s attr %lx size %lu limit %lu\n", Path, (UINT64)Info->Attribute, (UINT64)Info->FileSize, (UINT64)Limit);
+    DarwinLog (L"DARWINBOOT: %s attr %lx size %lu limit %lu\n", Path, (UINT64)Info->Attribute, (UINT64)Info->FileSize, (UINT64)Limit);
     Status = EFI_BAD_BUFFER_SIZE;
     goto Done;
   }
@@ -443,6 +485,193 @@ ValidTrustCaches (CONST UINT8 *Data, UINTN Size)
   return TRUE;
 }
 
+// The device tree as AdtNode() accepted it: the offset just past the node at Offset.
+STATIC
+BOOLEAN
+AdtNodeEnd (CONST UINT8 *Data, UINTN Size, UINTN Offset, UINTN Depth, UINTN *End)
+{
+  UINT32 Properties;
+  UINT32 Children;
+  UINT32 Length;
+  UINTN  Index;
+
+  if ((Depth > 64) || (Offset > Size) || (Size - Offset < 8)) { return FALSE; }
+  Properties = U32 (Data + Offset);
+  Children = U32 (Data + Offset + 4);
+  Offset += 8;
+  for (Index = 0; Index < Properties; Index++) {
+    if (Size - Offset < 36) { return FALSE; }
+    Length = U32 (Data + Offset + 32);
+    Offset += 36;
+    if (Length > Size - Offset) { return FALSE; }
+    Offset = ALIGN_VALUE (Offset + Length, 4);
+    if (Offset > Size) { return FALSE; }
+  }
+  for (Index = 0; Index < Children; Index++) {
+    if (!AdtNodeEnd (Data, Size, Offset, Depth + 1, &Offset)) { return FALSE; }
+  }
+  *End = Offset;
+  return TRUE;
+}
+
+// The value of property Name of the node at Node: its offset in the tree and its length.
+STATIC
+BOOLEAN
+AdtProperty (CONST UINT8 *Data, UINTN Size, UINTN Node, CONST CHAR8 *Name, UINTN *Value, UINT32 *Length)
+{
+  UINT32 Properties;
+  UINT32 Index;
+  UINTN  Offset;
+
+  if ((Node > Size) || (Size - Node < 8)) { return FALSE; }
+  Properties = U32 (Data + Node);
+  Offset = Node + 8;
+  for (Index = 0; Index < Properties; Index++) {
+    if (Size - Offset < 36) { return FALSE; }
+    *Length = U32 (Data + Offset + 32);
+    if (*Length > Size - Offset - 36) { return FALSE; }
+    if ((ScanMem8 (Data + Offset, 32, 0) != NULL) && (AsciiStrCmp ((CONST CHAR8 *)(Data + Offset), Name) == 0)) {
+      *Value = Offset + 36;
+      return TRUE;
+    }
+    Offset = ALIGN_VALUE (Offset + 36 + *Length, 4);
+  }
+  return FALSE;
+}
+
+// The child of the node at Node whose name is Name.
+STATIC
+BOOLEAN
+AdtChild (CONST UINT8 *Data, UINTN Size, UINTN Node, CONST CHAR8 *Name, UINTN *Child)
+{
+  UINT32 Children;
+  UINT32 Index;
+  UINT32 Length;
+  UINTN  Offset;
+  UINTN  Value;
+  UINTN  NameLength;
+
+  if ((Node > Size) || (Size - Node < 8)) { return FALSE; }
+  Children = U32 (Data + Node + 4);
+  // past the node's own properties: the end of a node without its children
+  Offset = Node + 8;
+  for (Index = 0; Index < U32 (Data + Node); Index++) {
+    if (Size - Offset < 36) { return FALSE; }
+    Length = U32 (Data + Offset + 32);
+    if (Length > Size - Offset - 36) { return FALSE; }
+    Offset = ALIGN_VALUE (Offset + 36 + Length, 4);
+  }
+  NameLength = AsciiStrSize (Name);
+  for (Index = 0; Index < Children; Index++) {
+    if (AdtProperty (Data, Size, Offset, "name", &Value, &Length) && (Length >= NameLength) &&
+        (CompareMem (Data + Value, Name, NameLength) == 0)) {
+      *Child = Offset;
+      return TRUE;
+    }
+    if (!AdtNodeEnd (Data, Size, Offset, 1, &Offset)) { return FALSE; }
+  }
+  return FALSE;
+}
+
+// Property Name of /chosen, its offset and length.
+STATIC
+BOOLEAN
+AdtChosen (CONST UINT8 *Data, UINTN Size, CONST CHAR8 *Name, UINTN *Value, UINT32 *Length)
+{
+  UINTN Chosen;
+
+  return AdtChild (Data, Size, 0, "chosen", &Chosen) && AdtProperty (Data, Size, Chosen, Name, Value, Length);
+}
+
+// Seconds since 1970 by the firmware's clock, or 0 when it has none.
+STATIC
+UINT64
+FirmwareEpoch (VOID)
+{
+  STATIC CONST UINT16  BeforeMonth[12] = { 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334 };
+  EFI_TIME             Time;
+  UINT64               Days;
+  UINT64               Seconds;
+
+  if ((gST->RuntimeServices == NULL) || EFI_ERROR (gST->RuntimeServices->GetTime (&Time, NULL)) ||
+      (Time.Year < 2024) || (Time.Year > 2099) || (Time.Month < 1) || (Time.Month > 12)) { return 0; }
+  Days = (UINT64)(Time.Year - 1970) * 365 + (Time.Year - 1969) / 4 + BeforeMonth[Time.Month - 1] + (Time.Day - 1);
+  if ((Time.Month > 2) && ((Time.Year % 4) == 0)) { Days++; }
+  Seconds = Days * 86400 + (UINT64)Time.Hour * 3600 + (UINT64)Time.Minute * 60 + Time.Second;
+  if (Time.TimeZone != EFI_UNSPECIFIED_TIMEZONE) { Seconds += (INT64)Time.TimeZone * 60; }
+  return Seconds;
+}
+
+// The kernel starts on the core that runs this and takes the first of /cpus (cpu0, cpu1, ...) for it: the core
+// whose "reg" (MPIDR affinity) is this core's changes places with cpu0 (only the reg values move); a list that
+// does not have this core at all gets it as cpu0.
+STATIC
+VOID
+BootCoreFirst (UINT8 *Tree, UINTN TreeSize)
+{
+  UINTN   Cpus;
+  UINTN   Node;
+  UINTN   Value;
+  UINTN   First;
+  UINT32  Length;
+  UINT32  Self;
+  UINT32  Index;
+  CHAR8   Name[8];
+
+  Self = (UINT32)(DarwinMpidr () & 0xFFFFFF);
+  if (!AdtChild (Tree, TreeSize, 0, "cpus", &Cpus) || !AdtChild (Tree, TreeSize, Cpus, "cpu0", &Node) ||
+      !AdtProperty (Tree, TreeSize, Node, "reg", &First, &Length) || (Length != 4) || (U32 (Tree + First) == Self)) {
+    return;
+  }
+  for (Index = 1; Index < 64; Index++) {
+    AsciiSPrint (Name, sizeof (Name), "cpu%u", Index);
+    if (!AdtChild (Tree, TreeSize, Cpus, Name, &Node)) { break; }
+    if (AdtProperty (Tree, TreeSize, Node, "reg", &Value, &Length) && (Length == 4) && (U32 (Tree + Value) == Self)) {
+      WriteUnaligned32 ((UINT32 *)(Tree + Value), U32 (Tree + First));
+      break;
+    }
+  }
+  DarwinLog (L"DARWINBOOT: the boot core 0x%x goes first in /cpus\n", Self);
+  WriteUnaligned32 ((UINT32 *)(Tree + First), Self);
+}
+
+// What only the boot can know, into the placeholders of /chosen that the tree on the ESP carries (all optional,
+// all zero there): dram-base and dram-size (the window), el2-trampoline (where the kernel's cores enter at EL2),
+// random-seed (any length) and boot-epoch (the firmware's clock).
+STATIC
+VOID
+FillTree (UINT8 *Tree, UINTN TreeSize, UINT64 DramBase, UINT64 DramSize, UINT64 Trampoline)
+{
+  UINTN   Value;
+  UINT32  Length;
+  UINT32  Index;
+  UINT64  Seed;
+  UINT64  Mixed;
+
+  if (AdtChosen (Tree, TreeSize, "dram-base", &Value, &Length) && (Length == 8)) { WriteUnaligned64 ((UINT64 *)(Tree + Value), DramBase); }
+  if (AdtChosen (Tree, TreeSize, "dram-size", &Value, &Length) && (Length == 8)) { WriteUnaligned64 ((UINT64 *)(Tree + Value), DramSize); }
+  if (AdtChosen (Tree, TreeSize, "el2-trampoline", &Value, &Length) && (Length == 8)) {
+    WriteUnaligned64 ((UINT64 *)(Tree + Value), Trampoline);
+  }
+  if (AdtChosen (Tree, TreeSize, "boot-epoch", &Value, &Length) && (Length == 8)) {
+    WriteUnaligned64 ((UINT64 *)(Tree + Value), FirmwareEpoch ());
+  }
+  BootCoreFirst (Tree, TreeSize);
+  if (AdtChosen (Tree, TreeSize, "random-seed", &Value, &Length)) {
+    // (splitmix64 over the counter, the time and where things landed: not a cryptographic source)
+    Seed = DarwinCounter () ^ (FirmwareEpoch () << 20) ^ DramBase ^ (UINT64)(UINTN)Tree;
+    for (Index = 0; Index < Length; Index++) {
+      if ((Index & 7) == 0) {
+        Seed += 0x9E3779B97F4A7C15ULL ^ DarwinCounter ();
+        Mixed = (Seed ^ (Seed >> 30)) * 0xBF58476D1CE4E5B9ULL;
+        Mixed = (Mixed ^ (Mixed >> 27)) * 0x94D049BB133111EBULL;
+        Mixed ^= Mixed >> 31;
+      }
+      Tree[Value + Index] = (UINT8)(Mixed >> (8 * (Index & 7)));
+    }
+  }
+}
+
 STATIC
 EFI_STATUS
 GetMap (EFI_MEMORY_DESCRIPTOR **Map, UINTN *Capacity, UINTN *Size, UINTN *Key, UINTN *Stride)
@@ -537,9 +766,13 @@ DiagDraw (CONST CHAR16 *Text, UINTN Row)
   }
 }
 
+// The window of a kernel that knows of no excluded ranges: WindowSize bytes of free memory in one run, starting
+// on a BLOCK_SIZE boundary (the kernel goes at its link address's offset inside the first block, the boot
+// arguments' physical and virtual bases are the window's start and that block's). When no run holds WindowSize
+// bytes, the largest run does, down to WINDOW_MIN, and *WindowSize says what was taken.
 STATIC
 EFI_STATUS
-AllocateWindow (KERNEL *Kernel, UINT64 WindowSize, EFI_PHYSICAL_ADDRESS *Address)
+AllocateWindow (KERNEL *Kernel, UINT64 *WindowSizeInOut, EFI_PHYSICAL_ADDRESS *Address)
 {
   EFI_MEMORY_DESCRIPTOR *Map;
   EFI_MEMORY_DESCRIPTOR *Descriptor;
@@ -549,45 +782,57 @@ AllocateWindow (KERNEL *Kernel, UINT64 WindowSize, EFI_PHYSICAL_ADDRESS *Address
   UINTN                 Key;
   UINTN                 Stride;
   UINTN                 Offset;
+  UINTN                 Pass;
   UINT64                End;
   UINT64                Candidate;
-  UINT64                BestStart;
-  UINT64                BestBytes;
-  UINT64                RunBytes;
+  UINT64                Room;
+  UINT64                BestRoom;
+  UINT64                WindowSize;
 
+  (VOID)Kernel;
   *Address = 0;
   Map = NULL;
   Capacity = 0;
-  BestStart = 0;
-  BestBytes = 0;
+  BestRoom = 0;
+  WindowSize = *WindowSizeInOut;
   Status = GetMap (&Map, &Capacity, &Size, &Key, &Stride);
   if (EFI_ERROR (Status)) { if (Map != NULL) { FreePool (Map); } return Status; }
   Status = EFI_OUT_OF_RESOURCES;
-  for (Offset = 0; Offset + Stride <= Size; Offset += Stride) {
-    Descriptor = (EFI_MEMORY_DESCRIPTOR *)((UINT8 *)Map + Offset);
-    if ((Descriptor->Type != EfiConventionalMemory) || (Descriptor->NumberOfPages == 0)) { continue; }
-    End = RunEnd (Map, Size, Stride, Descriptor->PhysicalStart,
-                  Descriptor->PhysicalStart + EFI_PAGES_TO_SIZE (Descriptor->NumberOfPages));
-    RunBytes = End - Descriptor->PhysicalStart;
-    if (RunBytes > BestBytes) { BestBytes = RunBytes; BestStart = Descriptor->PhysicalStart; }
-    Candidate = ALIGN_VALUE (Descriptor->PhysicalStart, BLOCK_SIZE) + (Kernel->Base & (BLOCK_SIZE - 1));
-    if ((Candidate < Descriptor->PhysicalStart) || (End < Candidate) || (End - Candidate < WindowSize)) { continue; }
-    Status = gBS->AllocatePages (AllocateAddress, EfiLoaderCode, EFI_SIZE_TO_PAGES (WindowSize), &Candidate);
-    if (!EFI_ERROR (Status)) { *Address = Candidate; break; }
+  for (Pass = 0; (Pass < 2) && EFI_ERROR (Status); Pass++) {
+    if (Pass == 1) {
+      if ((BestRoom < WINDOW_MIN) || (BestRoom >= WindowSize)) { break; }
+      DarwinLog (L"DARWINBOOT: no free run of 0x%lx bytes; the window is the largest, 0x%lx bytes\n", WindowSize, BestRoom);
+      WindowSize = BestRoom;
+    }
+    for (Offset = 0; Offset + Stride <= Size; Offset += Stride) {
+      Descriptor = (EFI_MEMORY_DESCRIPTOR *)((UINT8 *)Map + Offset);
+      if ((Descriptor->Type != EfiConventionalMemory) || (Descriptor->NumberOfPages == 0)) { continue; }
+      End = RunEnd (Map, Size, Stride, Descriptor->PhysicalStart,
+                    Descriptor->PhysicalStart + EFI_PAGES_TO_SIZE (Descriptor->NumberOfPages));
+      Candidate = ALIGN_VALUE (Descriptor->PhysicalStart, BLOCK_SIZE);
+      if ((Candidate < Descriptor->PhysicalStart) || (End <= Candidate)) { continue; }
+      Room = (End - Candidate) & ~((UINT64)BLOCK_SIZE - 1);
+      if (Room > BestRoom) { BestRoom = Room; }
+      if (Room < WindowSize) { continue; }
+      Status = gBS->AllocatePages (AllocateAddress, EfiLoaderCode, EFI_SIZE_TO_PAGES (WindowSize), &Candidate);
+      if (!EFI_ERROR (Status)) { *Address = Candidate; break; }
+    }
   }
   if (EFI_ERROR (Status)) {
     CHAR16 Line[96];
     UINTN  Row = 1;
-    UnicodeSPrint (Line, sizeof (Line), L"NO WINDOW %lx BIG RUN %lx @ %lx", WindowSize, BestBytes, BestStart);
+    UnicodeSPrint (Line, sizeof (Line), L"NO WINDOW %lx BIG RUN %lx", WindowSize, BestRoom);
     DiagDraw (Line, 0);
     for (Offset = 0; Offset + Stride <= Size; Offset += Stride) {
       Descriptor = (EFI_MEMORY_DESCRIPTOR *)((UINT8 *)Map + Offset);
       if ((Descriptor->Type == EfiConventionalMemory) && (Descriptor->NumberOfPages >= 0x400) && (Row < 8)) {
         UnicodeSPrint (Line, sizeof (Line), L"FREE %lx + %lx", Descriptor->PhysicalStart, EFI_PAGES_TO_SIZE (Descriptor->NumberOfPages));
+        DarwinLog (L"DARWINBOOT: %s\n", Line);
         DiagDraw (Line, Row++);
       }
     }
-
+  } else {
+    *WindowSizeInOut = WindowSize;
   }
   FreePool (Map);
   return Status;
@@ -826,23 +1071,36 @@ Boot (
   UINTN                           OutsideCount;
   UINT64                          OutsideBytes;
   DARWIN_LOADER_INPUT             Inputs[DARWIN_INPUT_COUNT];
+  UINT64                          Lead;
+  UINT64                          KernelAddress;
+  UINT64                          EntryAddress;
+  EFI_PHYSICAL_ADDRESS            TrampolineBase;
+  UINTN                           TrampolinePages;
+  UINT64                          Trampoline;
+  UINT64                          El2Vectors;
 
   (VOID)This;
   if ((Request == NULL) || (Request->Volume == NULL) || (Request->KernelPath == NULL)) { return EFI_INVALID_PARAMETER; }
+  // At EL1 the kernel is entered as it is; at EL2 (the Pixel 8a) it is entered at EL1 below an EL2 that keeps
+  // only DarwinEl2Trampoline (Entry.S).
   if ((Request->KextCount != 0) || (Request->DeviceTree != NULL) || (Request->DeviceTreeSize != 0) ||
-      (DarwinCurrentEl () != 4)) {
-    Print (L"DARWINBOOT: unsupported inputs or exception level; firmware retained\n");
+      ((DarwinCurrentEl () != 4) && (DarwinCurrentEl () != 8))) {
+    DarwinLog (L"DARWINBOOT: unsupported inputs or exception level; firmware retained\n");
     return EFI_UNSUPPORTED;
   }
+  TrampolineBase = 0;
+  TrampolinePages = 0;
+  Trampoline = 0;
+  El2Vectors = 0;
   if (!RamdiskLayout (Request->Ramdisk, Request->RamdiskSize, &RamdiskExpandedSize, &RamdiskPacked)) {
-    Print (L"DARWINBOOT: ramdisk layout rejected, %lu bytes\n", (UINT64)Request->RamdiskSize);
+    DarwinLog (L"DARWINBOOT: ramdisk layout rejected, %lu bytes\n", (UINT64)Request->RamdiskSize);
     return EFI_BAD_BUFFER_SIZE;
   }
   ZeroMem (CommandLine, sizeof (CommandLine));
   if (Request->BootArgs != NULL) {
     for (Index = 0; Request->BootArgs[Index] != 0; Index++) {
       if ((Index >= sizeof (CommandLine) - 1) || (Request->BootArgs[Index] > 0x7f)) {
-        Print (L"DARWINBOOT: boot args rejected at %lu\n", (UINT64)Index);
+        DarwinLog (L"DARWINBOOT: boot args rejected at %lu\n", (UINT64)Index);
         return EFI_BAD_BUFFER_SIZE;
       }
       CommandLine[Index] = (CHAR8)Request->BootArgs[Index];
@@ -957,8 +1215,13 @@ Boot (
   Status = ReadBootVideo (Video);
   if (EFI_ERROR (Status)) { goto Fail; }
   RamdiskBytes = ALIGN_VALUE (KeepPacked ? Request->RamdiskSize : RamdiskExpandedSize, EFI_PAGE_SIZE);
+  // A window without excluded ranges starts on a block boundary and holds the kernel at its link address's offset
+  // inside the first block (Lead): the boot arguments' bases are then block aligned, as XNU's first page tables
+  // map whole blocks from the block that holds the kernel's header, all of it the kernel's own memory.
+  Lead = 0;
   if (ExcludedOffset == MAX_UINTN) {
-    Status = AllocateWindow (&Kernel, WindowSize, &Address);
+    Lead = Kernel.Base & (BLOCK_SIZE - 1);
+    Status = AllocateWindow (&Kernel, &WindowSize, &Address);
     Allocated = WindowSize;
   } else {
     PlaceImage (BLOCK_SIZE + (Kernel.Base & (BLOCK_SIZE - 1)), &Kernel, TreeSize, RamdiskBytes, TrustCacheSize, AddonSize, PolicySize, &Layout);
@@ -967,37 +1230,51 @@ Boot (
     Allocated = HeadSize;
   }
   if (EFI_ERROR (Status)) { goto Fail; }
-  PlaceImage (Address, &Kernel, TreeSize, RamdiskBytes, TrustCacheSize, AddonSize, PolicySize, &Layout);
+  KernelAddress = Address + Lead;
+  EntryAddress = KernelAddress + Kernel.Entry - Kernel.Base;
+  PlaceImage (KernelAddress, &Kernel, TreeSize, RamdiskBytes, TrustCacheSize, AddonSize, PolicySize, &Layout);
   ArgsAddress = Layout.Args;
   TreeAddress = Layout.Tree;
   RamdiskAddress = Layout.Ramdisk;
   TrustCacheAddress = Layout.TrustCache;
   AddonAddress = Layout.Addon;
   PolicyAddress = Layout.Policy;
-  Used = Layout.Used;
+  Used = Layout.Used + Lead;
   if (Used > WindowSize - BLOCK_SIZE) {
-    Print (L"DARWINBOOT: used %lu window %lu kernel %lu ramdisk %lu\n", (UINT64)Used, (UINT64)WindowSize, (UINT64)(Kernel.End - Kernel.Base), (UINT64)RamdiskBytes);
+    DarwinLog (L"DARWINBOOT: used %lu window %lu kernel %lu ramdisk %lu\n", (UINT64)Used, (UINT64)WindowSize, (UINT64)(Kernel.End - Kernel.Base), (UINT64)RamdiskBytes);
     Status = EFI_BAD_BUFFER_SIZE;
     goto Fail;
   }
+  // At EL2 the kernel's cores get the EL2 code they keep: out of the image, into memory outside the window.
+  if (DarwinCurrentEl () == 8) {
+    TrampolinePages = EFI_SIZE_TO_PAGES (DarwinEl2TrampolineSize + SIZE_2KB);
+    Status = gBS->AllocatePages (AllocateAnyPages, EfiLoaderData, TrampolinePages, &TrampolineBase);
+    if (EFI_ERROR (Status)) { TrampolineBase = 0; goto Fail; }
+    // (the vectors want 2 KiB alignment; the code is position independent)
+    Trampoline = TrampolineBase + ((0 - (TrampolineBase + DarwinEl2VectorsOffset)) & (SIZE_2KB - 1));
+    El2Vectors = Trampoline + DarwinEl2VectorsOffset;
+    CopyMem ((VOID *)(UINTN)Trampoline, DarwinEl2Trampoline, (UINTN)DarwinEl2TrampolineSize);
+    DarwinFlush (TrampolineBase, EFI_PAGES_TO_SIZE (TrampolinePages));
+  }
   ZeroMem ((VOID *)(UINTN)Address, (UINTN)Used);
   for (Index = 0; Index < Kernel.Count; Index++) {
-    CopyMem ((VOID *)(UINTN)(Address + Kernel.Segments[Index].Address - Kernel.Base),
+    CopyMem ((VOID *)(UINTN)(KernelAddress + Kernel.Segments[Index].Address - Kernel.Base),
              (UINT8 *)Image + Kernel.Segments[Index].FileOffset, (UINTN)Kernel.Segments[Index].FileSize);
   }
   Args = (DARWIN_BOOT_ARGS *)(UINTN)ArgsAddress;
   Args->Revision = 2;
   Args->Version = 2;
-  Args->VirtualBase = Kernel.Base;
+  Args->VirtualBase = Kernel.Base - Lead;
   Args->PhysicalBase = Address;
   Args->MemorySize = WindowSize;
   Args->MemorySizeActual = WindowSize;
   Args->TopOfKernelData = Address + Used;
   CopyMem (Args->Video, Video, sizeof (Video));
-  Args->DeviceTree = Kernel.Base + TreeAddress - Address;
+  Args->DeviceTree = Kernel.Base + TreeAddress - KernelAddress;
   Args->DeviceTreeLength = (UINT32)TreeSize;
   CopyMem (Args->CommandLine, CommandLine, sizeof (CommandLine));
   CopyMem ((VOID *)(UINTN)TreeAddress, Tree, TreeSize);
+  FillTree ((UINT8 *)(UINTN)TreeAddress, TreeSize, Address, WindowSize, Trampoline);
   if (Request->Ramdisk != NULL) {
     if (KeepPacked) { CopyMem ((VOID *)(UINTN)RamdiskAddress, Request->Ramdisk, Request->RamdiskSize); }
     else { CopyRamdisk ((VOID *)(UINTN)RamdiskAddress, Request->Ramdisk, Request->RamdiskSize, RamdiskPacked); }
@@ -1030,16 +1307,21 @@ Boot (
   if (InputsOffset != MAX_UINTN) { LocateInputs (Request, Inputs); }
   Status = GetMap (&Map, &Capacity, &MapSize, &Key, &Stride);
   if (EFI_ERROR (Status)) { goto Fail; }
-  Print (L"DARWINBOOT: ARM64 va=0x%lx pa=0x%lx args=0x%lx entry=0x%lx owned=0x%lx\n",
-         Kernel.Base, Address, ArgsAddress, Address + Kernel.Entry - Kernel.Base, (UINT64)WindowSize);
+  DarwinLog (L"DARWINBOOT: ARM64 va=0x%lx pa=0x%lx args=0x%lx entry=0x%lx owned=0x%lx\n",
+         Kernel.Base, KernelAddress, ArgsAddress, EntryAddress, (UINT64)WindowSize);
+  DarwinLog (L"DARWINBOOT: boot_args virtBase=0x%lx physBase=0x%lx memSize=0x%lx topOfKernelData=0x%lx tree=0x%lx+0x%x\n",
+         Args->VirtualBase, Args->PhysicalBase, Args->MemorySize, Args->TopOfKernelData, Args->DeviceTree,
+         Args->DeviceTreeLength);
+  DarwinLog (L"DARWINBOOT: EL%lu MPIDR 0x%lx; EL2 trampoline 0x%lx vectors 0x%lx\n", DarwinCurrentEl () >> 2,
+         DarwinMpidr (), Trampoline, El2Vectors);
   if (OutsideOffset != MAX_UINTN) {
     // As this map gives it; the table XNU reads comes from the map ExitBootServices accepts.
     OutsideCount = DarwinOutsideRanges (Map, MapSize, Stride, Address, WindowSize, SIZE_64KB, SIZE_1MB,
                                         (UINT8 *)(UINTN)(TreeAddress + OutsideOffset), OutsideCapacity, &OutsideBytes);
-    Print (L"DARWINBOOT: free memory outside the window: %lu ranges of %lu, 0x%lx bytes\n",
+    DarwinLog (L"DARWINBOOT: free memory outside the window: %lu ranges of %lu, 0x%lx bytes\n",
            (UINT64)OutsideCount, (UINT64)OutsideCapacity, OutsideBytes);
     for (Index = 0; Index < OutsideCount; Index++) {
-      Print (L"DARWINBOOT: outside 0x%lx + 0x%lx\n",
+      DarwinLog (L"DARWINBOOT: outside 0x%lx + 0x%lx\n",
              DarwinRangeBase ((UINT8 *)(UINTN)(TreeAddress + OutsideOffset), Index),
              DarwinRangeSize ((UINT8 *)(UINTN)(TreeAddress + OutsideOffset), Index));
     }
@@ -1048,10 +1330,10 @@ Boot (
     // The inputs as this map gives them; the records XNU reads come from the map ExitBootServices accepts.
     DarwinDescribeInputs (Map, &MapSize, Capacity, Stride, Address, WindowSize, ExcludedOffset != MAX_UINTN, Inputs);
     DarwinWriteInputs ((UINT8 *)(UINTN)(TreeAddress + InputsOffset), Inputs);
-    Print (L"DARWINBOOT: payload disk 0x%lx + 0x%lx type %d state %x usable 0x%lx\n",
+    DarwinLog (L"DARWINBOOT: payload disk 0x%lx + 0x%lx type %d state %x usable 0x%lx\n",
            Inputs[DARWIN_INPUT_PAYLOAD_DISK].Base, Inputs[DARWIN_INPUT_PAYLOAD_DISK].Size, (INT32)Inputs[DARWIN_INPUT_PAYLOAD_DISK].Type,
            Inputs[DARWIN_INPUT_PAYLOAD_DISK].State, Inputs[DARWIN_INPUT_PAYLOAD_DISK].Usable);
-    Print (L"DARWINBOOT: initrd buffer 0x%lx + 0x%lx type %d state %x usable 0x%lx\n",
+    DarwinLog (L"DARWINBOOT: initrd buffer 0x%lx + 0x%lx type %d state %x usable 0x%lx\n",
            Inputs[DARWIN_INPUT_INITRD].Base, Inputs[DARWIN_INPUT_INITRD].Size, (INT32)Inputs[DARWIN_INPUT_INITRD].Type,
            Inputs[DARWIN_INPUT_INITRD].State, Inputs[DARWIN_INPUT_INITRD].Usable);
   }
@@ -1062,16 +1344,18 @@ Boot (
       Status = EFI_LOAD_ERROR;
       goto Fail;
     }
-    Print (L"DARWINBOOT: window head=0x%lx usable=0x%lx excluded ranges=%lu of %lu\n",
+    DarwinLog (L"DARWINBOOT: window head=0x%lx usable=0x%lx excluded ranges=%lu of %lu\n",
            HeadSize, Args->MemorySizeActual, (UINT64)ExcludedCount, (UINT64)ExcludedCapacity);
     for (Index = 0; Index < ExcludedCount; Index++) {
-      Print (L"DARWINBOOT: excluded 0x%lx + 0x%lx\n", DarwinRangeBase (Excluded, Index), DarwinRangeSize (Excluded, Index));
+      DarwinLog (L"DARWINBOOT: excluded 0x%lx + 0x%lx\n", DarwinRangeBase (Excluded, Index), DarwinRangeSize (Excluded, Index));
     }
   }
-  Print (L"DARWINBOOT: video base=0x%lx display=%lu row=%lu width=%lu height=%lu depth=%lu\n",
+  DarwinLog (L"DARWINBOOT: video base=0x%lx display=%lu row=%lu width=%lu height=%lu depth=%lu\n",
          Video[0], Video[1], Video[2], Video[3], Video[4], Video[5]);
-  Print (L"DARWINBOOT: command line: %a\n", CommandLine);
-  Print (L"DARWINBOOT: inputs validated; exiting boot services\n");
+  DarwinLog (L"DARWINBOOT: command line: %a\n", CommandLine);
+  DarwinLog (L"DARWINBOOT: entry words %08x %08x %08x %08x\n", U32 ((VOID *)(UINTN)EntryAddress),
+             U32 ((VOID *)(UINTN)(EntryAddress + 4)), U32 ((VOID *)(UINTN)(EntryAddress + 8)), U32 ((VOID *)(UINTN)(EntryAddress + 12)));
+  DarwinLog (L"DARWINBOOT: inputs validated; exiting boot services\n");
 
   //
   // The same facts in large type over the whole screen. The firmware's log
@@ -1080,7 +1364,7 @@ Boot (
   //
   DEBUG ((DEBUG_ERROR, "\fDARWINBOOT: hand-off to the kernel\n\n"));
   DEBUG ((DEBUG_ERROR, "kernel   va 0x%lx  pa 0x%lx\n", Kernel.Base, Address));
-  DEBUG ((DEBUG_ERROR, "entry    pa 0x%lx\n", Address + Kernel.Entry - Kernel.Base));
+  DEBUG ((DEBUG_ERROR, "entry    pa 0x%lx\n", EntryAddress));
   DEBUG ((DEBUG_ERROR, "args     pa 0x%lx  window 0x%lx bytes\n", ArgsAddress, (UINT64)WindowSize));
   if (Excluded != NULL) {
     DEBUG ((DEBUG_ERROR, "memory   usable 0x%lx  excluded ranges %lu\n", Args->MemorySizeActual, (UINT64)ExcludedCount));
@@ -1093,10 +1377,10 @@ Boot (
   }
   DEBUG ((DEBUG_ERROR, "video    base 0x%lx  %lux%lu  row %lu bytes  %lu bpp\n", Video[0], Video[3], Video[4], Video[2], Video[5]));
   DEBUG ((DEBUG_ERROR, "entry words %08x %08x %08x %08x\n",
-          ReadUnaligned32 ((CONST UINT32 *)(UINTN)(Address + Kernel.Entry - Kernel.Base)),
-          ReadUnaligned32 ((CONST UINT32 *)(UINTN)(Address + Kernel.Entry - Kernel.Base + 4)),
-          ReadUnaligned32 ((CONST UINT32 *)(UINTN)(Address + Kernel.Entry - Kernel.Base + 8)),
-          ReadUnaligned32 ((CONST UINT32 *)(UINTN)(Address + Kernel.Entry - Kernel.Base + 12))));
+          ReadUnaligned32 ((CONST UINT32 *)(UINTN)(EntryAddress)),
+          ReadUnaligned32 ((CONST UINT32 *)(UINTN)(EntryAddress + 4)),
+          ReadUnaligned32 ((CONST UINT32 *)(UINTN)(EntryAddress + 8)),
+          ReadUnaligned32 ((CONST UINT32 *)(UINTN)(EntryAddress + 12))));
   DEBUG ((DEBUG_ERROR, "CurrentEL %lu  SCTLR_EL1 0x%lx  TCR_EL1 0x%lx\n", DarwinCurrentEl () >> 2, READ_SYSREG (sctlr_el1), READ_SYSREG (tcr_el1)));
   DEBUG ((DEBUG_ERROR, "ID_AA64MMFR0_EL1 0x%lx  (PARange %lu, 4 KiB granule %a)\n", READ_SYSREG (id_aa64mmfr0_el1),
           READ_SYSREG (id_aa64mmfr0_el1) & 0xF, (((READ_SYSREG (id_aa64mmfr0_el1) >> 28) & 0xF) == 0xF) ? "NOT supported" : "supported"));
@@ -1127,7 +1411,7 @@ Boot (
     Status = gBS->ExitBootServices (mImage, Key);
     if (!EFI_ERROR (Status)) {
       if (Excluded == NULL) {
-        DarwinEnter (ArgsAddress, Address + Kernel.Entry - Kernel.Base, Address, WindowSize, Video[0], Video[2] * Video[4]);
+        DarwinEnter (ArgsAddress, EntryAddress, Address, WindowSize, Video[0], Video[2] * Video[4], El2Vectors);
         CpuDeadLoop ();
       }
       // The usable memory behind the head leaves the data cache as the head does in DarwinEnter. An excluded
@@ -1138,7 +1422,7 @@ Boot (
         Cursor = DarwinRangeBase (Excluded, Index) + DarwinRangeSize (Excluded, Index);
       }
       if (Address + WindowSize > Cursor) { DarwinFlush (Cursor, Address + WindowSize - Cursor); }
-      DarwinEnter (ArgsAddress, Address + Kernel.Entry - Kernel.Base, Address, HeadSize, Video[0], Video[2] * Video[4]);
+      DarwinEnter (ArgsAddress, EntryAddress, Address, HeadSize, Video[0], Video[2] * Video[4], El2Vectors);
       CpuDeadLoop ();
     }
     if (Status != EFI_INVALID_PARAMETER) { CpuDeadLoop (); }
@@ -1155,7 +1439,8 @@ Fail:
   if (TreePath != NULL) { FreePool (TreePath); }
   if (Map != NULL) { FreePool (Map); }
   if (Address != 0) { gBS->FreePages (Address, EFI_SIZE_TO_PAGES (Allocated)); }
-  Print (L"DARWINBOOT: boot refused: %r; firmware retained\n", Status);
+  if (TrampolineBase != 0) { gBS->FreePages (TrampolineBase, TrampolinePages); }
+  DarwinLog (L"DARWINBOOT: boot refused: %r; firmware retained\n", Status);
   return Status;
 }
 
@@ -1186,7 +1471,7 @@ DarwinBootEntry (EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
   Status = gBS->InstallMultipleProtocolInterfaces (&ImageHandle, &gUniXNULoaderProtocolGuid, &mLoader, NULL);
   if (!EFI_ERROR (Status)) {
     Loaded->Unload = Unload;
-    Print (L"DARWINBOOT: loader v2 installed EL%u\n", (UINT32)(DarwinCurrentEl () >> 2));
+    DarwinLog (L"DARWINBOOT: loader v2 installed EL%u\n", (UINT32)(DarwinCurrentEl () >> 2));
   }
   return Status;
 }

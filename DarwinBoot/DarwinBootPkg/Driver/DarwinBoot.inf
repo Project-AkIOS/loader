@@ -37,6 +37,7 @@
   gEfiLoadedImageProtocolGuid ## CONSUMES
   gEfiGraphicsOutputProtocolGuid ## CONSUMES
   gEfiBlockIoProtocolGuid ## SOMETIMES_CONSUMES
+  gEfiSerialIoProtocolGuid ## SOMETIMES_CONSUMES
 
 [Guids]
   gEfiFileInfoGuid
