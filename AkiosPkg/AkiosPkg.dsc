@@ -1,16 +1,16 @@
 ## @file
-#  AkIOS's loader for akita: AkiosBoot.efi (UniXNU's boot manager, started by U-Boot), DarwinBoot.efi (the XNU
-#  loader driver) and Fat.efi (EDK2's FAT driver, for the ESP image in the boot payload).
+#  AkIOS's loader, the same for every device: UniXNU.efi (the boot manager our firmware starts from the ESP),
+#  DarwinBoot.efi (the XNU loader driver) and Fat.efi (EDK2's FAT driver).
 #
 #  SPDX-License-Identifier: BSD-2-Clause-Patent
 ##
 
 [Defines]
-  PLATFORM_NAME           = Akita
+  PLATFORM_NAME           = Akios
   PLATFORM_GUID           = 0E7A5C93-2B1F-4D86-A4C7-58F1E3B90D26
   PLATFORM_VERSION        = 0.1
   DSC_SPECIFICATION       = 0x0001001C
-  OUTPUT_DIRECTORY        = Build/Akita
+  OUTPUT_DIRECTORY        = Build/Akios
   SUPPORTED_ARCHITECTURES = AARCH64
   BUILD_TARGETS           = DEBUG|RELEASE
   SKUID_IDENTIFIER        = DEFAULT
@@ -46,7 +46,6 @@
   gUniXNUPkgTokenSpaceGuid.PcdUniXNUConfigPath|L"\\EFI\\UniXNU\\akios.toml"
 
 [Components]
-  AkitaPkg/Application/AkiosBoot/AkiosBoot.inf
   UniXNUPkg/Application/UniXNU/UniXNU.inf
   DarwinBootPkg/Driver/DarwinBoot.inf
   FatPkg/EnhancedFatDxe/Fat.inf
